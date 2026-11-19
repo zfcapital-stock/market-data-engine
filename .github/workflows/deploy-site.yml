@@ -1,0 +1,62 @@
+name: Deploy Site
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Daily Stock Screening, US Daily Stock Screening]
+    types: [completed]
+permissions:
+  contents: write
+  id-token: write
+concurrency:
+  group: company-sites-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || (vars.ENABLE_UPDATES == 'true' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore both market databases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/restore_release_db.py tw
+          python scripts/restore_release_db.py us
+      - name: Sync company classifications
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_CREDENTIALS_PATH: credentials.json
+          SHEET_ID_COMPANY_MASTER: ${{ secrets.SHEET_ID_COMPANY_MASTER }}
+          US_SHEET_ID_COMPANY_MASTER: ${{ secrets.US_SHEET_ID_COMPANY_MASTER }}
+        run: |
+          printf '%s' "$GOOGLE_CREDS" > credentials.json
+          python scripts/sync_custom_overrides.py
+      - name: Export and validate both markets
+        id: export
+        run: |
+          python scripts/export_to_json_v2.py
+          python scripts/validate_export.py
+      - name: Publish member website
+        if: ${{ !cancelled() && steps.export.outcome == 'success' }}
+        env:
+          ZF_WORDPRESS_ORIGIN: ${{ secrets.ZF_WORDPRESS_ORIGIN }}
+          ZF_WORDPRESS_PUBLISH_KEY: ${{ secrets.ZF_WORDPRESS_PUBLISH_KEY }}
+        run: python scripts/publish_member_results.py --data-dir site/data
+      - name: Publish Cloudflare investment data
+        if: ${{ !cancelled() && steps.export.outcome == 'success' }}
+        env:
+          ZF_PUBLISH_SITE: ${{ secrets.ZF_PUBLISH_SITE }}
+        run: python scripts/publish_to_sites.py
+      - name: Publish complete JSON release
+        if: ${{ !cancelled() && steps.export.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python scripts/publish_site_data_release.py
