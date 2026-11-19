@@ -1,0 +1,142 @@
+name: Sync Company Google Sheets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sync:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        market: [tw, us]
+    concurrency:
+      group: ${{ matrix.market }}-db-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MARKET: ${{ matrix.market }}
+      GOOGLE_CREDENTIALS_PATH: credentials.json
+      SHEET_ID_COMPANY_MASTER: ${{ secrets.SHEET_ID_COMPANY_MASTER }}
+      SHEET_ID_TW_VCP: ${{ secrets.SHEET_ID_TW_VCP }}
+      SHEET_ID_TW_SANXIAN: ${{ secrets.SHEET_ID_TW_SANXIAN }}
+      SHEET_ID_TW_VOLUME_SURGE: ${{ secrets.SHEET_ID_TW_VOLUME_SURGE }}
+      SHEET_ID_VERIFICATION: ${{ secrets.SHEET_ID_VERIFICATION }}
+      US_SHEET_ID_COMPANY_MASTER: ${{ secrets.US_SHEET_ID_COMPANY_MASTER }}
+      US_SHEET_ID_VCP: ${{ secrets.US_SHEET_ID_VCP }}
+      US_SHEET_ID_SANXIAN: ${{ secrets.US_SHEET_ID_SANXIAN }}
+      US_SHEET_ID_VOLUME_SURGE: ${{ secrets.US_SHEET_ID_VOLUME_SURGE }}
+      US_SHEET_ID_VERIFICATION: ${{ secrets.US_SHEET_ID_VERIFICATION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate company credentials and Sheets access
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import gspread
+          from google.oauth2.service_account import Credentials
+          from google.auth.transport.requests import Request
+          try:
+              info = json.loads(os.environ['GOOGLE_CREDS'])
+              assert info.get('type') == 'service_account'
+              creds = Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
+              creds.refresh(Request())
+          except Exception as exc:
+              raise SystemExit('Credential validation failed: ' + type(exc).__name__)
+          Path('credentials.json').write_text(json.dumps(info))
+          Path('credentials.json').chmod(0o600)
+          client = gspread.authorize(creds)
+          prefix = 'US_SHEET_ID_' if os.environ['MARKET'] == 'us' else 'SHEET_ID_'
+          ids = {k: v for k, v in os.environ.items() if k.startswith(prefix)}
+          assert len(ids) == 5 and all(ids.values()), 'Five Sheet IDs are required'
+          for key, value in sorted(ids.items()):
+              sheet = client.open_by_key(value)
+              assert sheet.title.startswith('藏鋒選股－'), 'Unexpected target sheet'
+              print('READ OK:', key)
+          print('Company credential authentication: OK')
+          PY
+      - name: Restore company database snapshot (no Release writes)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/restore_release_db.py "$MARKET"
+      - name: Export and verify latest results
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          from datetime import date
+          from pathlib import Path
+          market = os.environ['MARKET']
+          if market == 'us':
+              from tasks.us_daily_task import USDailyTask as Task
+              from config.us_settings import US_SHEET_IDS as ids
+              table = 'us_filter_result'
+              prefix, label = '', '美股'
+          else:
+              from tasks.daily_task import DailyTask as Task
+              from config.settings import SHEET_IDS as ids
+              table = 'filter_result'
+              prefix, label = 'tw_', '台股'
+          task = Task(client=object())  # No network price fetch; use existing algorithms.
+          assert task.exporter.health_check(), 'Sheets authentication failed'
+          with sqlite3.connect(task.db.db_path) as conn:
+              latest = conn.execute('SELECT MAX(filter_date) FROM ' + table).fetchone()[0]
+          assert latest, 'No saved screening results'
+          target = date.fromisoformat(str(latest)[:10])
+          types = ('vcp', 'sanxian', 'volume_surge')
+          expected = {kind: set(task.db.get_filter_results(kind, target)['stock_id'].astype(str)) for kind in types}
+          assert set().union(*expected.values()), 'Empty market snapshot'
+          # Recompute only the disposable runner copy to prepare verification details.
+          # This workflow has no Release upload and cannot replace production backups.
+          vcp, sanxian, volume, market_return = task._run_filters(target)
+          results = dict(zip(types, (vcp, sanxian, volume)))
+          for kind, rows in results.items():
+              assert {str(row['stock_id']) for row in rows} == expected[kind], 'Recalculation mismatch: ' + kind
+          master = task.db.get_all_stock_info().fillna('').to_dict('records')
+          assert master, 'Empty company master'
+          for row in master:
+              row['company_name'] = row.get('stock_name', '')
+              row['product_mix'] = '-'
+              if market == 'us':
+                  row['industry_category'] = row.get('sector', '-')
+                  row['industry_category2'] = row.get('industry', '-')
+          ex = task.exporter
+          assert ex.export_company_master(master), 'Company master export failed'
+          master_ws = ex.client.open_by_key(ids['company_master']).worksheet(label + '公司主檔')
+          assert set(master_ws.col_values(1)[1:]) == {str(row['stock_id']) for row in master}, 'Company master readback failed'
+          print('MASTER VERIFIED:', market, len(master))
+          for kind, rows in results.items():
+              kwargs = {} if kind == 'volume_surge' else {'prev_stock_ids': task._get_recent_stock_ids(target, kind)}
+              assert getattr(ex, 'export_' + kind)(rows, target, **kwargs), 'Export failed: ' + kind
+              ws = ex.client.open_by_key(ids[prefix + kind]).worksheet(ex._format_date_tab(target))
+              actual = set(ws.col_values(1)[1:])
+              assert actual == expected[kind], 'Readback mismatch: ' + kind
+              print('RESULT VERIFIED:', market, target, kind, len(actual))
+          assert ex.export_verification(task._vcp_verification_data, task._sanxian_verification_data, target, market_return), 'Verification export failed'
+          verification = ex.client.open_by_key(ids['verification'])
+          for suffix, rows in [('_VCP', task._vcp_verification_data), ('_三線', task._sanxian_verification_data)]:
+              ws = verification.worksheet(ex._format_date_tab(target) + suffix)
+              assert len(ws.col_values(1)) == len(rows) + 2, 'Verification readback mismatch'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(f'## {label} Google Sheets sync verified\n\nDate: {target}\n\n')
+              f.write(f'Company master: {len(master)}\n\n')
+              for kind in types:
+                  f.write(f'- {kind}: {len(expected[kind])}\n')
+              f.write('\nAll five sheets written and read back. Production database backup unchanged.\n')
+          PY
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -f credentials.json
