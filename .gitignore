@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+credentials*.json
+*credentials*.json
+*.pem
+*.key
+*.db
+*.db-*
+*.gz
+logs/
+site/data/
