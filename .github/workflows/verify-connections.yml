@@ -1,0 +1,63 @@
+name: Verify connections
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests google-auth
+      - name: Verify service credentials and sheet editor access without changing cells
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SHEET_ID_COMPANY_MASTER: ${{ secrets.SHEET_ID_COMPANY_MASTER }}
+          SHEET_ID_TW_VCP: ${{ secrets.SHEET_ID_TW_VCP }}
+          SHEET_ID_TW_SANXIAN: ${{ secrets.SHEET_ID_TW_SANXIAN }}
+          SHEET_ID_TW_VOLUME_SURGE: ${{ secrets.SHEET_ID_TW_VOLUME_SURGE }}
+          SHEET_ID_VERIFICATION: ${{ secrets.SHEET_ID_VERIFICATION }}
+          US_SHEET_ID_COMPANY_MASTER: ${{ secrets.US_SHEET_ID_COMPANY_MASTER }}
+          US_SHEET_ID_VCP: ${{ secrets.US_SHEET_ID_VCP }}
+          US_SHEET_ID_SANXIAN: ${{ secrets.US_SHEET_ID_SANXIAN }}
+          US_SHEET_ID_VOLUME_SURGE: ${{ secrets.US_SHEET_ID_VOLUME_SURGE }}
+          US_SHEET_ID_VERIFICATION: ${{ secrets.US_SHEET_ID_VERIFICATION }}
+        run: |
+          python - <<'PY'
+          import os,json,sys,requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession
+          stage='credentials'
+          try:
+              info=json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+              creds=service_account.Credentials.from_service_account_info(info,scopes=['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive'])
+              session=AuthorizedSession(creds)
+              names=['SHEET_ID_COMPANY_MASTER', 'SHEET_ID_TW_VCP', 'SHEET_ID_TW_SANXIAN', 'SHEET_ID_TW_VOLUME_SURGE', 'SHEET_ID_VERIFICATION', 'US_SHEET_ID_COMPANY_MASTER', 'US_SHEET_ID_VCP', 'US_SHEET_ID_SANXIAN', 'US_SHEET_ID_VOLUME_SURGE', 'US_SHEET_ID_VERIFICATION']
+              for name in names:
+                  stage=name
+                  sid=os.environ[name]
+                  assert sid, 'missing secret'
+                  meta=session.get('https://sheets.googleapis.com/v4/spreadsheets/'+sid,params={'fields':'sheets.properties.title'},timeout=30)
+                  assert meta.status_code==200, 'Sheets API denied'
+                  tabs=meta.json().get('sheets',[])
+                  assert tabs, 'no worksheets'
+                  rights=session.get('https://www.googleapis.com/drive/v3/files/'+sid,params={'fields':'capabilities(canEdit)','supportsAllDrives':'true'},timeout=30)
+                  assert rights.status_code==200 and rights.json().get('capabilities',{}).get('canEdit') is True, 'editor permission missing'
+                  print(name+': Sheets read OK; Drive editor permission OK',flush=True)
+              stage='FINMIND_TOKEN'
+              token=os.environ['FINMIND_TOKEN']
+              assert token,'missing token'
+              response=requests.get('https://api.finmindtrade.com/api/v4/data',params={'dataset':'TaiwanStockPrice','data_id':'2330','start_date':'2026-11-18','end_date':'2026-11-18','token':token},timeout=60)
+              assert response.status_code==200,'HTTP failure'
+              data=response.json()
+              assert data.get('status')==200 and len(data.get('data',[]))>0,'API rejected request or returned no prices'
+              print('FINMIND_TOKEN: authenticated price request returned data',flush=True)
+          except Exception:
+              print('::error::Connection check failed at '+stage+'; credential values and API responses suppressed')
+              sys.exit(1)
+          print('All connection checks passed. No spreadsheet cells changed.')
+          PY
