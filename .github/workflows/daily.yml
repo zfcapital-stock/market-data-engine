@@ -2,6 +2,9 @@
 name: Daily Stock Screening
 
 on:
+  schedule:
+    - cron: '0 7 * * 1-5'
+    - cron: '30 8 * * 1-5'
   # 台灣時間 15:00 首次更新、16:30 補抓；GitHub 排程可能延遲。
   # 同市場維持 tw-db-write 互斥，兩次任務不得同時寫入資料庫。
   workflow_dispatch:
