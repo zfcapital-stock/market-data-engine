@@ -2,6 +2,8 @@
 name: US Daily Stock Screening
 
 on:
+  schedule:
+    - cron: '30 22 * * 1-5'
   # Company fallback schedule (UTC); Apps Script may also dispatch manually.
   workflow_dispatch:
     inputs:
