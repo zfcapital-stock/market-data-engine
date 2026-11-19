@@ -1,0 +1,53 @@
+name: Verify member publishing
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish validated results to the member website
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: member-publish
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore verified market databases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/restore_release_db.py tw
+          python scripts/restore_release_db.py us
+      - name: Export and validate
+        run: |
+          python scripts/export_to_json_v2.py
+          python scripts/validate_export.py
+      - name: Verify original member interface adapter
+        run: |
+          python - <<'PY'
+          import sys,tempfile,json
+          from pathlib import Path
+          sys.path.insert(0,'scripts')
+          from publish_member_results import prepare
+          with tempfile.TemporaryDirectory() as folder:
+              files=prepare('site/data',folder)
+              index=json.loads((Path(folder)/'index.json').read_text())
+              assert all(index['market_dates'].get(m) for m in ('tw','us'))
+              print('Member result adapter passed:',index['market_dates'],'files:',len(files))
+          PY
+      - name: Publish verified results
+        if: inputs.publish
+        env:
+          ZF_WORDPRESS_ORIGIN: ${{ secrets.ZF_WORDPRESS_ORIGIN }}
+          ZF_WORDPRESS_PUBLISH_KEY: ${{ secrets.ZF_WORDPRESS_PUBLISH_KEY }}
+        run: python scripts/publish_member_results.py --data-dir site/data
