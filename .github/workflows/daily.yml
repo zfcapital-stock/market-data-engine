@@ -1,0 +1,117 @@
+# 每日股票篩選任務
+name: Daily Stock Screening
+
+on:
+  # 台灣時間 15:00 首次更新、16:30 補抓；GitHub 排程可能延遲。
+  # 同市場維持 tw-db-write 互斥，兩次任務不得同時寫入資料庫。
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: '目標日期 (YYYY-MM-DD，留空使用今天)'
+        required: false
+        default: ''
+      force:
+        description: '強制執行（忽略假日）'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: tw-db-write
+  cancel-in-progress: false
+
+jobs:
+  daily-task:
+    if: vars.ENABLE_UPDATES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 需要寫入權限才能建立 Release
+      actions: read    # 需要讀取權限才能下載 Artifact
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore verified company database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/restore_release_db.py tw
+
+      - name: Set up Google credentials
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          if [ -n "$GOOGLE_CREDS" ]; then
+            echo "$GOOGLE_CREDS" > credentials.json
+            echo "✅ Google credentials 已設定"
+          else
+            echo "⚠️ 未設定 GOOGLE_CREDENTIALS_JSON"
+          fi
+
+      - name: Initialize system if needed
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ ! -f "data/zf_trend.db" ]; then
+            echo "資料庫不存在，執行初始化..."
+            python main.py init
+          else
+            echo "資料庫已存在，跳過初始化"
+            ls -la data/
+          fi
+
+      - name: Run daily task
+        env:
+          GOOGLE_CREDENTIALS_PATH: credentials.json
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SHEET_ID_COMPANY_MASTER: ${{ secrets.SHEET_ID_COMPANY_MASTER }}
+          SHEET_ID_TW_VCP: ${{ secrets.SHEET_ID_TW_VCP }}
+          SHEET_ID_TW_SANXIAN: ${{ secrets.SHEET_ID_TW_SANXIAN }}
+          SHEET_ID_TW_VOLUME_SURGE: ${{ secrets.SHEET_ID_TW_VOLUME_SURGE }}
+          SHEET_ID_VERIFICATION: ${{ secrets.SHEET_ID_VERIFICATION }}
+        run: |
+          if [ "${{ github.event.inputs.target_date }}" != "" ]; then
+            if [ "${{ github.event.inputs.force }}" == "true" ]; then
+              python main.py daily ${{ github.event.inputs.target_date }} --force
+            else
+              python main.py daily ${{ github.event.inputs.target_date }}
+            fi
+          else
+            if [ "${{ github.event.inputs.force }}" == "true" ]; then
+              python main.py daily --force
+            else
+              python main.py daily
+            fi
+          fi
+
+      # 備份到 GitHub Release（永久保存）
+      - name: Backup database to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "備份資料庫到 Release..."
+          # 檢查 release 是否存在，不存在則建立
+          if ! gh release view db-backup &>/dev/null; then
+            echo "建立新的 Release..."
+            gh release create db-backup \
+              --title "Database Backup" \
+              --notes "SQLite 資料庫自動備份 (永久保存)"
+          fi
+          # 壓縮並上傳資料庫（覆蓋舊檔）
+          echo "壓縮資料庫..."
+          gzip -c data/zf_trend.db > /tmp/zf_trend_full.db.gz
+          gh release upload db-backup /tmp/zf_trend_full.db.gz --clobber
+          echo "✅ 備份完成"
+
+      # 同時保存到 Artifact（方便快速存取）
