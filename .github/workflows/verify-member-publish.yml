@@ -45,6 +45,28 @@ jobs:
               assert all(index['market_dates'].get(m) for m in ('tw','us'))
               print('Member result adapter passed:',index['market_dates'],'files:',len(files))
           PY
+      - name: Verify publisher authentication without activating a snapshot
+        env:
+          ZF_WORDPRESS_ORIGIN: ${{ secrets.ZF_WORDPRESS_ORIGIN }}
+          ZF_WORDPRESS_PUBLISH_KEY: ${{ secrets.ZF_WORDPRESS_PUBLISH_KEY }}
+        run: |
+          python - <<'PY'
+          import os,json,hashlib,urllib.request,urllib.error,sys
+          sys.path.insert(0,'scripts')
+          from publish_member_results import NoRedirect
+          body=b'{"connection_check":"member-publisher"}'
+          origin=os.environ['ZF_WORDPRESS_ORIGIN'].rstrip('/')
+          key=os.environ['ZF_WORDPRESS_PUBLISH_KEY']
+          assert origin.startswith('https://') and 32<=len(key)<=256
+          request=urllib.request.Request(origin+'/wp-json/zf-results/v1/object/'+hashlib.sha256(body).hexdigest(),data=body,headers={'Content-Type':'application/json','X-ZF-Publish-Key':key},method='POST')
+          try:
+              with urllib.request.build_opener(NoRedirect).open(request,timeout=60) as response:
+                  assert json.load(response).get('ok') is True
+          except Exception:
+              print('::error::Publisher authentication/storage check failed; sensitive details suppressed')
+              sys.exit(1)
+          print('Publisher key accepted and object stored. Active website snapshot unchanged.')
+          PY
       - name: Publish verified results
         if: inputs.publish
         env:
