@@ -1,0 +1,29 @@
+name: Validate snapshot
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: snapshot-validation
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore both databases from this repository only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/restore_release_db.py tw
+          python scripts/restore_release_db.py us
+      - name: Export and validate without publishing or writing Sheets
+        run: |
+          python scripts/export_to_json_v2.py
+          python scripts/validate_export.py
+          python scripts/publish_site_data_release.py --help
